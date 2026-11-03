@@ -1,0 +1,31 @@
+# ---- PlatformIO 构建产物（约 195MB，全部可重新生成）----
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ---- 第三方依赖库 ----
+# 本地 libs/ 里是指向别的项目的**符号链接**，绝对路径对别人没有意义；
+# M5GFX 一个库就有 152MB，也不可能进仓库。
+# 新机器 clone 后跑一次：bash tools/setup_libs.sh
+libs/
+
+# ---- macOS ----
+.DS_Store
+._*
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- 录制日志（个人动作数据，不是源码）----
+padlog-*.csv
+
+# ---- 固件二进制 ----
+*.bin
+*.elf
+*.map
+
+# ---- 本地开发记录（个人笔记，不进公开仓库）----
+.workbuddy/

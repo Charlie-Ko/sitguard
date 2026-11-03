@@ -1,0 +1,1466 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SitGuard · 体感打砖块</title>
+<style>
+  /* ------------------------------------------------------------
+     配色跟设备屏幕是同一套（深蓝黑底 + 青色强调 + 暖黄警示），
+     这样低头看设备、抬头看屏幕，眼睛不用重新适应。
+     ------------------------------------------------------------ */
+  :root{
+    --bg:      #070b1c;
+    --bg2:     #0d1330;
+    --panel:   #121a3d;
+    --line:    #24305c;
+    --ink:     #e8ecff;
+    --dim:     #7b87b8;
+    --cyan:    #4de2ff;
+    --green:   #4dd4ac;
+    --warm:    #ffb347;
+    --pink:    #ff6b9d;
+    --red:     #ff5c72;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden}
+  body{
+    background:
+      radial-gradient(1200px 700px at 50% -10%, #16204a 0%, transparent 70%),
+      var(--bg);
+    color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro SC","PingFang SC",
+                "Helvetica Neue",Arial,sans-serif;
+    display:flex;align-items:center;justify-content:center;
+    -webkit-font-smoothing:antialiased;
+    user-select:none;
+  }
+  /* 3:5 的竖屏舞台，高度顶格、宽度按比例反算。
+     上一版写的是 height:100vh + max-width:100vw —— 窗口比 3:5 窄的时候
+     max-width 会把宽度压下来，高度却还是 100vh，比例就破了，
+     画布被纵向拉伸 7%，球和挡板都变成椭圆。用 min() 从宽度反推高度才稳。 */
+  #stage{position:relative;width:min(100vw, 60vh);aspect-ratio:3/5}
+  canvas{display:block;width:100%;height:100%;cursor:default}
+
+  /* ---------------- 操作提示 ----------------
+     贴到最底下 10px。上一版放 bottom:86px，正好压在挡板（画布 y=706）身上；
+     而且挡板是玩家唯一要盯的东西，任何常驻元素都不许占那条带子。
+     12 秒后自动淡出 —— 记住快捷键之后它就是噪音，按 H 可再唤回。 */
+  #tips{
+    position:absolute;left:14px;bottom:10px;text-align:left;
+    font-size:10px;color:var(--dim);line-height:1.75;
+    opacity:.42;transition:opacity .5s;
+  }
+  #tips b{color:var(--cyan);font-weight:600}
+  #tips.hide{opacity:0}
+
+  /* 调试面板：按 D 显示原始加速度。方向不对时靠它定位，不用改代码重烧。 */
+  #dbg{
+    position:absolute;left:14px;top:14px;display:none;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11px;color:var(--cyan);line-height:1.6;
+    background:rgba(7,11,28,.8);border:1px solid var(--line);
+    border-radius:8px;padding:8px 10px;white-space:pre;
+  }
+  #dbg.on{display:block}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv" width="480" height="800"></canvas>
+
+  <div id="dbg"></div>
+
+  <div id="tips">
+    <div><b>空格</b> 发球 &nbsp; <b>T</b> 转向/摆幅/倾斜</div>
+    <div><b>[ ]</b> 灵敏度 &nbsp; <b>F</b> 反向 &nbsp; <b>O</b> 或 <b>0</b> 录像</div>
+    <div><b>D</b> 调试 &nbsp; <b>H</b> 隐藏</div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ============================================================
+//  SitGuard 体感打砖块 · v2
+//
+//  数据来源两条腿：
+//    ① BLE 手柄（Web Bluetooth 订阅自定义 GATT 的 notify）
+//    ② 鼠标 / 键盘（兜底，保证任何时候都能玩，也方便没设备时调参）
+//
+//  ------------------------------------------------------------
+//  三种控制方式（按 T 循环，默认 rate）
+//
+//  A. rate —— 默认。手左右挥，挡板按**角速度**滑。
+//     这是空鼠（air mouse）品类二十年来的定论做法：陀螺仪测的是转动，
+//     转动直接映射成光标**速度**（rate control），不做任何积分。
+//     为什么不是位移：加速度计两次积分到位移（dead reckoning）误差随时间
+//     平方增长，业界原话是「传感器精度限制…基本没有解决的可能性」。
+//     v0.8.2 走的就是位移那条路，所以「很难精准控制」——不是参数没调好。
+//     链路：ω → 去零偏 → 死区 → 归一化 → expo → 1€ → ×速度上限 → 积分成位置。
+//
+//  B. swing —— v0.8.2 的老路，留着做对照。线性加速度积一次成速度再泄漏。
+//     手感偏「滑」，适合甩着玩，不适合微调。
+//
+//  C. tilt —— 绝对映射，歪多少板在哪。想精确点射时最稳，但手要一直举着。
+//
+//  ------------------------------------------------------------
+//  为什么 rate 模式不看「哪根轴」：用绕世界竖直轴的角速度
+//
+//      yaw = −( ω · ĝ )        ĝ = 加速度归一化（静止时就是「上」）
+//
+//  ω·ĝ 是「绕竖直方向的转动分量」，**和怎么握无关**。竖握、横握、斜着捏，
+//  左右挥永远是同一个符号。这比「猜哪根轴是左右」稳健得多：
+//  空鼠资料里管这叫「运动平面不匹配」——设备一歪，同样的动作会划出斜线，
+//  办法就是拿加速度测倾角做传感器融合，而不是硬挑一根轴。
+//
+//  ------------------------------------------------------------
+//  倾斜模式的解算：不算「哪根轴」，算「屏幕平面里的侧倾角」
+//
+//  v1 的做法是连上后给 2.5 秒窗口，看三轴里哪根变化最大就用哪根。
+//  那个思路在竖直握持下必错 —— 竖着拿，左右歪是绕「屏幕法线」的侧倾，
+//  重力只会往屏幕的 x 轴跑；而同时手还会不自觉地前后点一下，
+//  y 轴的变化幅度反而更大，于是算法稳定地挑中错的那根。
+//
+//  v2 用几何解：
+//    · 设备坐标系：x = 屏幕右，y = 屏幕下，z = 屏幕法线（指向背面）。
+//      （实测：屏幕朝上平放时 az ≈ −1g，所以 +z 指向背面）
+//    · 零点存「刚握住那一刻重力在屏幕平面上的投影 p0」。
+//    · 每个包算当前投影 p 相对 p0 的带符号夹角 θ：
+//          θ = atan2( p0 × p , p0 · p )
+//      正 = 屏幕顶端往右歪。这个量和握法无关：立着、斜靠、托着都对，
+//      因为不管零点在哪，「再往右歪一点」都对应同一个旋转方向。
+//    · 竖直握持时 p0≈(0,1)，p=(sinθ,cosθ)，于是它退化成 sinθ ≈ θ，
+//      在零点附近是**线性**的 —— 这正是打砖块需要的。
+//
+//  倾斜模式的滤波用 1€ Filter（Casiez/Roussel/Vogel, CHI 2012）：
+//    静止时截止频率低 → 不抖；动起来截止频率自动抬高 → 不拖。
+//    这是交互输入领域的标准解法，Chrome for Android 的触摸输入也在用它。
+// ============================================================
+
+// ---------------- BLE 协议常量（与 blepad.h 一一对应）----------------
+const SVC_UUID  = '6b8d0001-3e2a-4c11-9f71-2d8a5b6c7e01';
+const TX_UUID   = '6b8d0002-3e2a-4c11-9f71-2d8a5b6c7e01';
+const NAME_HINT = 'SitGuard';
+
+// ---------------- rate 模式参数（v0.9 默认）----------------
+// 全部单位用「物理量」而不是「调好的魔法数字」，这样调参时知道自己在调什么：
+//   YAW_DEAD   °/s   死区（低于这个角速度算「没动」）
+//   YAW_FULL   °/s   满偏角速度（到这个值输出 ±1）
+//   RATE_EXPO  —     指数曲线强度（0 线性，越大中心越细）
+//   RATE_SPAN  秒    满偏时横穿全屏用多久 → 决定了最大板速
+const YAW_DEAD  = 9.0;    // 手腕静止时陀螺零偏 + 手抖约 3~8°/s，取 9 全压住
+const YAW_FULL  = 170.0;  // 自然挥腕峰值 150~250°/s。取 170 让「正常一挥」刚好吃满
+const RATE_EXPO = 0.55;   // 中心细、末端不迟钝。0.55 比手柄常见的 0.3 更偏精细
+let   RATE_SPAN = +(localStorage.getItem('sg_span') || 0.55);
+// 陀螺零偏：静止时慢慢学（τ≈0.6s），只在「真的静止」时才学。
+// 这一步是空鼠资料的「动态自校正」——MEMS 陀螺零偏随温度漂，
+// 出厂标一次不够，必须运行时自己盯着。
+const BIAS_TAU  = 0.6;
+const STILL_DPS = 14.0;   // 判定静止：三轴角速度模长小于这个值
+const STILL_G   = 0.10;   // 且 |f| 与 1g 的偏差小于这个值
+const STILL_N   = 12;     // 且连续这么多帧（100Hz 下约 120ms）
+
+// ---------------- 倾斜手感参数 ----------------
+const TILT_FULL_DEG = 28;    // 歪 28° 打满全屏。手腕自然行程约 ±35°，留点余量
+const TILT_DEAD_DEG = 2.2;   // 死区：静止手抖 ±2°，不加死区挡板会自己爬
+const TILT_EXPO     = 0.30;  // 手柄摇杆常用的 expo 值：中段细，末端不迟钝
+const OE_FC_MIN     = 1.1;   // 1€ 滤波器低频截止（Hz）
+const OE_BETA       = 0.035; // 速度系数：越大越跟手、越小越稳
+const OE_DCUTOFF    = 1.0;   // 速度信号自己的截止频率
+
+// ---------------- 摆动手感参数 ----------------
+// 思路：加速度计减去重力 = 手的线性加速度（Android 里叫 TYPE_LINEAR_ACCELERATION，
+// 也是 iOS 的 userAcceleration，都是同一个量）。把它积成速度、再泄漏一点，
+// 就得到「一挥就滑出去、手停就停在原地」的手感 —— 这正是体感遥控器那套。
+const GRAV_FC   = 0.55;   // 【只在没有陀螺仪时用】重力慢估计的截止频率（Hz）
+const AHRS_KP   = 0.5;    // 【有陀螺仪时】加速度对重力估计的修正强度（1/秒）。
+                          //   它只治陀螺的零偏漂移，所以故意做慢：0.5 相当于 2 秒时间常数，
+                          //   一次 0.3 秒的挥手只被它拉走 15%，不会把挥手本身当成姿态变化。
+                          //   调大 → 更信加速度（会被挥手带偏）；调小 → 更信陀螺（会慢慢漂）
+const ACC_LPF   = 0.50;   // 线性加速度自己的低通系数（66Hz 下约 15Hz 截止）
+const ACC_DEAD  = 0.012;  // 加速度死区（g）。0.012g ≈ 0.12 m/s²，压掉手抖和 IMU 噪声
+const SW_TAU    = 0.30;   // 速度泄漏时间常数（秒）：越大越接近「手的真实位移」，越小越干脆
+const SW_VMAX   = 5.0;    // 手速上限（m/s），防止一抖就飞天
+// 注意：**不能给速度加死区**。速度是加速度的积分，轻挥时每个包只加 0.01m/s，
+// 一进死区就被清零，积分器永远爬不上去 —— 表现就是「轻轻挥完全没反应」。
+// 死区只加在加速度上（ACC_DEAD），速度靠泄漏自己归零。
+// 增益 = 手移动 1 米，挡板移动多少像素。
+//
+// 这个数不能拍脑袋：挡板位移 = 速度对时间的积分 = 手的**位移**（量纲上就是），
+// 所以它本质是「手的一米对应屏幕几像素」。第一版取 650，等于要求手移 74cm
+// 才能横穿屏幕 —— 挥手根本没那么大幅度，表现出来就是「怎么挥都不动」。
+// 实测手腕自然挥幅约 20~30cm，横穿全屏取 480/0.32 ≈ 1500。
+// 觉得不够远按 ]，太飘按 [。
+let   SW_GAIN   = +(localStorage.getItem('sg_gain') || 1700);
+
+const CAL_MS        = 700;   // 校准窗口：静止这么久取平均当零点
+const FLAT_G        = 0.30;  // 屏幕平面投影小于此值 = 平放着，读不出左右
+
+// ---------------- 画布 / 逻辑尺寸 ----------------
+// 逻辑坐标固定 480×800，物理参数就不用跟着窗口大小变。
+const W = 480, H = 800;
+const cv  = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+
+(function fitDPR(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width  = W * dpr;
+  cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+})();
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp  = (a, b, t) => a + (b - a) * t;
+const rand  = (a, b) => a + Math.random() * (b - a);
+const sgn   = v => v < 0 ? -1 : 1;
+
+// ============================================================
+//  游戏状态
+// ============================================================
+const PADDLE_W = 86, PADDLE_H = 13, PADDLE_Y = 706;
+const BALL_R   = 7;
+
+const G = {
+  phase: 'ready',          // ready 待发球 | playing | dead 掉球 | clear 过关
+  score: 0,
+  best: +(localStorage.getItem('sg_best') || 0),
+  lives: 3,
+  level: 1,
+  combo: 0,
+  flash: 0,                // 白闪强度
+  paddle: { x: W / 2, w: PADDLE_W },
+  ball:   { x: W / 2, y: PADDLE_Y - BALL_R - 1, vx: 0, vy: 0, trail: [] },
+  bricks: [],
+  particles: [],
+  tilt: 0,                 // 平滑后的倾斜 -1..1
+  dip: 0,                  // 掉球后底边那条渐隐红光
+  lastT: 0,
+};
+
+// ============================================================
+//  砖块布局：每列一个颜色，纵向拉成长条 —— 参考实物拼图那种「彩色竖列」
+// ============================================================
+// 色相每隔约 45° 取一个，8 列各有自己的颜色。
+// 上一版第 4、5 列用了 160° 和 192°，差 32°，肉眼就是「两个青」——
+// 分开看都对，并排看像印刷没套准。
+const PALETTE = [
+  '#ff6b4a', '#ffd45c', '#a8e05f', '#3fd68a',
+  '#38d9e8', '#5b8cff', '#a56bff', '#ff6b9d',
+];
+
+// 8 列 × 52 + 7 × 6 = 458，两侧各留 11px —— 算好了再写，不然右边会贴边。
+const GRID = { cols: 8, rows: 6, x0: 11, y0: 110, w: 52, h: 28, gap: 6 };
+
+function buildLevel(level) {
+  G.bricks = [];
+  const rows = Math.min(GRID.rows + Math.floor((level - 1) / 2), 9);
+  const cols = GRID.cols;
+
+  for (let c = 0; c < cols; c++) {
+    const color = PALETTE[(c + level - 1) % PALETTE.length];
+    // 奇偶列错开一格，看起来像手摆的拼图而不是规整方阵。
+    // 只错一格：错太多会变成「一半的列凭空短一截」，反而像画错了。
+    const top = c % 2;
+    for (let r = top; r < rows; r++) {
+      // 高关卡：最上面几行变硬（打两下）
+      const hp = (level >= 3 && r < 2) ? 2 : 1;
+      G.bricks.push({
+        x: GRID.x0 + c * (GRID.w + GRID.gap),
+        y: GRID.y0 + r * (GRID.h + GRID.gap),
+        w: GRID.w, h: GRID.h,
+        color, hp, maxHp: hp,
+        hit: 0,               // 命中缩放动画 1 → 0
+      });
+    }
+  }
+}
+
+// ============================================================
+//  1€ Filter（一欧元滤波器）
+// ============================================================
+// 一阶低通：alpha 小 = 稳但拖，alpha 大 = 跟手但抖。
+// 1€ 的巧处是 alpha 随「速度」变：慢的时候当稳压器，快的时候当透明。
+class LowPass {
+  constructor() { this.y = 0; this.fresh = true; }
+  filter(x, a) {
+    if (this.fresh) { this.y = x; this.fresh = false; return x; }
+    this.y = a * x + (1 - a) * this.y;
+    return this.y;
+  }
+  reset() { this.fresh = true; }
+}
+
+class OneEuro {
+  constructor(fcMin, beta, dCut) {
+    this.fcMin = fcMin; this.beta = beta; this.dCut = dCut;
+    this.xf  = new LowPass();   // 信号本身
+    this.dxf = new LowPass();   // 速度
+    this.prev = null;
+  }
+  alpha(cutoff, dt) {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / dt);
+  }
+  // 返回 { y, speed }：speed 顺手给调试面板看
+  filter(x, dt) {
+    dt = clamp(dt, 0.004, 0.08);
+    const dx  = this.prev === null ? 0 : (x - this.prev) / dt;
+    const edx = this.dxf.filter(dx, this.alpha(this.dCut, dt));
+    const cut = this.fcMin + this.beta * Math.abs(edx);
+    const y   = this.xf.filter(x, this.alpha(cut, dt));
+    this.prev = x;
+    return { y, speed: edx, cutoff: cut };
+  }
+  reset() { this.xf.reset(); this.dxf.reset(); this.prev = null; }
+}
+
+// ============================================================
+//  BLE
+// ============================================================
+const Ble = {
+  device: null,
+  char: null,
+  connected: false,
+  lastPkt: 0,
+  ax: 0, ay: 0, az: 0,
+  btnA: false, btnB: false,
+  prevBtnB: false,
+  batt: 0,
+  pktCount: 0,
+  rawTilt: 0,              // 解算完、还没进游戏的倾斜量 -1..1
+  rawSwing: 0,             // 同上，摆动速度归一化后的值
+  gx: 0, gy: 0, gz: 0,     // 角速度 °/s（v2 包才有）
+  hasGyro: false,
+};
+
+// 方向反了按 F 翻，存在本地，下次打开还记着。
+let flipX = localStorage.getItem('sg_flip') === '1';
+
+// 控制方式：rate = 角速度转向（默认，v0.9），swing = 位移积分（v0.8.2），
+// tilt = 倾斜绝对映射。按 T 循环。
+// 三种都留着不是为了选项多 —— 手感这东西只有本人当场对比才知道要哪个，
+// 我不该替他决定，只该把三条路都铺好、并且默认给最靠谱的那条。
+let MODE = localStorage.getItem('sg_mode') || 'rate';
+
+// ---------------- 姿态解算状态 ----------------
+const Tilt = {
+  p0: null,            // 零点：静止时屏幕平面内的重力投影（单位向量）
+  calUntil: 0,         // 校准截止时刻
+  calN: 0, calX: 0, calY: 0,
+  rawDeg: 0,           // 原始角度（未滤波）
+  deg: 0,              // 1€ 滤波后
+  speed: 0,
+  flat: false,         // 平放着：读不出左右
+  oe: new OneEuro(OE_FC_MIN, OE_BETA, OE_DCUTOFF),
+  lastT: 0,
+};
+
+// ---------------- 摆动解算状态 ----------------
+// 「左右摆动」是手的**位移**，不是姿态。姿态靠重力方向就能读出来，
+// 位移只能靠线性加速度两次积分 —— 两次积分会漂，所以这里只积一次到**速度**，
+// 再让速度自然泄漏归零：挥一下滑一段，手一停就停在原地。
+// 这样做出来的手感和体感遥控器一致，而且不需要任何绝对参考，天然不会漂。
+const Sw = {
+  gh: null,     // 重力方向（「上」）的单位向量，设备坐标系 —— 陀螺 + 加速度融合出来的
+  gEst: null,   // 【无陀螺仪时】只跟屏幕左右那一根轴的慢估计
+  sign: 1,      // 陀螺符号自检用（真反了整体翻过来）
+  bad: 0,
+  a: 0,         // 减去重力后的线性加速度（g，屏幕 x 分量）
+  v: 0,         // 手速估计（m/s）
+  lastT: 0,
+};
+
+// ---------------- rate 解算状态（v0.9 默认模式）----------------
+// 只做三件事：学零偏、把 ω 投到竖直轴上、滤波成形。
+// 不积分到「角度」，也不碰加速度积分 —— 这是和 v0.8.2 最本质的区别。
+const Rate = {
+  bias: { x: 0, y: 0, z: 0 },
+  stillN: 0,        // 连续静止帧数
+  raw: 0,           // 原始 yaw（已去零偏，°/s）
+  yaw: 0,           // 滤波后 yaw（°/s）
+  u: 0,             // 归一化 + expo 后的 -1..1
+  v: 0,             // 挡板速度 px/s
+  oe: new OneEuro(1.6, 0.05, 1.0),
+  lastT: 0,
+};
+
+// ---------------- 动作录制（v0.9 新增）----------------
+// 目的：不再靠猜调参。按 O 开始录，做几下动作，再按 O 停止并下载 CSV；
+// 用 tools/analyze_log.js 离线看零偏、动作幅度、死区该给多少。
+const Rec = {
+  on: false,
+  t0: 0,
+  rows: [],
+  maxRows: 30000,   // 100Hz 下约 5 分钟，别把内存吃光
+};
+
+const DEG2RAD = Math.PI / 180;
+
+// 互补滤波（Mahony 那一路的简化版）：
+//   陀螺负责「快」—— 它直接测转动，不受平移干扰；
+//   加速度负责「稳」—— 它没有漂移，但分不清重力和手的加速度，所以只做慢速修正。
+//   一快一慢合起来，就把「举着歪住」（纯转动）和「左右挥」（纯平移）分开了。
+//   这是这轮最关键的一步：只有加速度时这两种情况在物理上读数完全一样
+//   （爱因斯坦的电梯），实测歪 10° 能甩 150px，真挥一把却只推 29px。
+function fuseGravity(fx, fy, fz, wx, wy, wz, dt) {
+  const m = Math.hypot(fx, fy, fz);
+  if (m < 0.25) return;                            // 自由落体/异常，本帧不更新
+  const ux = fx / m, uy = fy / m, uz = fz / m;     // 实测的「上」方向
+
+  if (!Sw.gh) { Sw.gh = { x: ux, y: uy, z: uz }; return; }
+  const g = Sw.gh;
+
+  // 1) 陀螺推进：设备转，重力在设备坐标系里反向转 →  d(gh)/dt = -ω × gh
+  const rx = wx * DEG2RAD * Sw.sign;
+  const ry = wy * DEG2RAD * Sw.sign;
+  const rz = wz * DEG2RAD * Sw.sign;
+  const cx = ry * g.z - rz * g.y;
+  const cy = rz * g.x - rx * g.z;
+  const cz = rx * g.y - ry * g.x;
+  let x = g.x - cx * dt, y = g.y - cy * dt, z = g.z - cz * dt;
+
+  // 2) 加速度慢修正（带门控）：只管漂移，不许抢陀螺的活。
+  //    门控的条件是 |f| ≈ 1g —— 只有「读数模长等于重力」时，加速度计才真的在测重力；
+  //    一旦在挥手，|f| 会偏离 1g（0.5g 的横向加速就是 1.12g），这时候加速度计的
+  //    方向是「重力 + 手的加速度」的合成，拿它去修正只会把挥手本身当成姿态变化。
+  //    这一步不做，挥完手会留下一个反方向的残余速度，挡板自己往回滑。
+  const gate = clamp(1 - (Math.abs(m - 1) - 0.06) / 0.14, 0, 1);
+  const kp = AHRS_KP * gate;
+  if (kp > 0) {
+    x += kp * (ux - x) * dt;
+    y += kp * (uy - y) * dt;
+    z += kp * (uz - z) * dt;
+  }
+
+  const n = Math.hypot(x, y, z) || 1;
+  g.x = x / n; g.y = y / n; g.z = z / n;
+
+  // 3) 发散自检：陀螺符号若猜反，估计值会持续往一边跑。
+  //    真出现就整体翻符号并重置 —— 宁可自愈，也不要让人对着一个疯掉的挡板猜。
+  const dev = Math.acos(clamp(g.x * ux + g.y * uy + g.z * uz, -1, 1));
+  if (dev > 0.8) {
+    if (++Sw.bad > 25) { Sw.sign = -Sw.sign; Sw.gh = { x: ux, y: uy, z: uz }; Sw.bad = 0; }
+  } else if (Sw.bad > 0) Sw.bad--;
+}
+
+function swingUpdate(f, t) {
+  const dt = Sw.lastT ? clamp((t - Sw.lastT) / 1000, 0.004, 0.06) : 0.015;
+  Sw.lastT = t;
+
+  let gx;
+  if (Ble.hasGyro) {
+    fuseGravity(f.x, f.y, f.z, Ble.gx, Ble.gy, Ble.gz, dt);
+    if (!Sw.gh) return;
+    // 线性加速度 = 实测加速度 − 重力。gh 是单位向量，静止时 |f| 正好 1g
+    gx = f.x - Sw.gh.x;
+  } else {
+    // 老路（11 字节包，没陀螺仪）：慢速跟踪重力分量。能挥，但「歪住」会被当成运动
+    if (Sw.gEst === null) Sw.gEst = f.x;
+    const A = 1 - Math.exp(-2 * Math.PI * GRAV_FC * dt);
+    Sw.gEst += (f.x - Sw.gEst) * A;
+    gx = f.x - Sw.gEst;
+  }
+
+  Sw.a += ACC_LPF * (gx - Sw.a);
+  if (Math.abs(Sw.a) < ACC_DEAD) Sw.a = 0;
+
+  Sw.v += Sw.a * 9.81 * dt;                 // g → m/s²，再积成速度
+  Sw.v *= Math.exp(-dt / SW_TAU);           // 泄漏：手停下，速度自然归零
+  Sw.v = clamp(Sw.v, -SW_VMAX, SW_VMAX);
+}
+
+function resetSwing() {
+  Sw.gh = null; Sw.gEst = null; Sw.a = 0; Sw.v = 0; Sw.lastT = 0; Sw.bad = 0;
+}
+
+// ============================================================
+//  rate 解算（v0.9 默认）
+// ============================================================
+// 只依赖一个物理量：绕**世界竖直轴**的角速度。
+//   yaw = −( ω · ĝ )，ĝ 由加速度归一化得到（静止时它就是「上」）
+// 负号：右手定则下往左转时 ω 指向 +ĝ，而用户心里「往右 = 正」。
+//
+// 为什么不用「哪根轴陀螺」：横握、竖握、斜着捏，设备的 x/y/z 在世界上指向
+// 完全不同，挑轴必然要人肉标定，换握法就废。点积 ĝ 之后只留下「左右转」，
+// 前后点、上下抬、绕屏幕转圈全被滤掉 —— 这正是我们想要的正交分解。
+function rateUpdate(f, t) {
+  const dt = Rate.lastT ? clamp((t - Rate.lastT) / 1000, 0.004, 0.06) : 0.01;
+  Rate.lastT = t;
+
+  // 没有陀螺仪（11 字节老包）就没法做 rate，交给 swing
+  if (!Ble.hasGyro || !Sw.gh) { Rate.raw = 0; Rate.yaw = 0; Rate.u = 0; Rate.v = 0; return; }
+
+  const wx = Ble.gx, wy = Ble.gy, wz = Ble.gz;
+  const m  = Math.hypot(f.x, f.y, f.z);
+
+  // ---- 静止检测 + 零偏慢学 ----
+  // 两个条件都要满足才算静止：角速度小、且模长≈1g（手上没别的加速度）。
+  // 只学「静止」时的值，是因为运动时的均值不是零偏，学进去就是自欺欺人。
+  const stillNow = Math.hypot(wx, wy, wz) < STILL_DPS && Math.abs(m - 1) < STILL_G;
+  if (stillNow) {
+    if (Rate.stillN < 9999) Rate.stillN++;
+    if (Rate.stillN > STILL_N) {
+      const a = 1 - Math.exp(-dt / BIAS_TAU);
+      Rate.bias.x += (wx - Rate.bias.x) * a;
+      Rate.bias.y += (wy - Rate.bias.y) * a;
+      Rate.bias.z += (wz - Rate.bias.z) * a;
+    }
+  } else {
+    Rate.stillN = 0;
+  }
+
+  // ---- 投影到竖直轴 ----
+  const cx = wx - Rate.bias.x;
+  const cy = wy - Rate.bias.y;
+  const cz = wz - Rate.bias.z;
+  let yaw = -(cx * Sw.gh.x + cy * Sw.gh.y + cz * Sw.gh.z);
+
+  // ---- 死区（角速度上）----
+  // 挖掉 ±YAW_DEAD 再把剩下的重新拉回 0，不然过死区会有一个突跳。
+  // 注意这是**角速度**的死区，不是速度的死区 —— v0.8.2 那个坑是给积分后的
+  // 速度加死区，会把积分器按死在零位，表现成「轻轻挥完全没反应」。
+  Rate.raw = yaw;
+  if (Math.abs(yaw) < YAW_DEAD) yaw = 0;
+  else yaw = sgn(yaw) * (Math.abs(yaw) - YAW_DEAD);
+
+  // ---- 1€ 滤波：静止不抖、挥动不拖 ----
+  const fr = Rate.oe.filter(yaw, dt);
+  Rate.yaw = fr.y;
+
+  // ---- 归一化 + expo ----
+  // expo 的意义：中心区（小角速度）压低输出 → 微调精度；
+  // 末端不压 → 大挥还是能一把甩到底。手柄摇杆那套曲线，同一个公式。
+  const u0 = clamp(Rate.yaw / YAW_FULL, -1, 1);
+  const a0 = Math.abs(u0);
+  const shaped = (1 - RATE_EXPO) * a0 + RATE_EXPO * a0 * a0 * a0;
+  Rate.u = sgn(u0) * shaped;
+
+  // ---- 输出成板速（px/s）----
+  // 满偏 = 横穿全屏用 RATE_SPAN 秒。这个量的直觉最强：
+  // 「我甩到底，板 0.55 秒从最左到最右」，比「增益 1700」好理解也好调。
+  Rate.v = (flipX ? -1 : 1) * Rate.u * (W / RATE_SPAN);
+}
+
+function resetRate() {
+  Rate.stillN = 0;
+  Rate.raw = 0; Rate.yaw = 0; Rate.u = 0; Rate.v = 0;
+  Rate.lastT = 0;
+  Rate.oe.reset();
+  // 零偏不清零：上一次学到的值大概率还准，清了反而要重新爬
+}
+
+// ============================================================
+//  动作录制 → CSV
+// ============================================================
+// 录的字段够离线重放整个算法：原始 6 轴 + 融合后的重力方向 + 学到的零偏 +
+// 每一级的中间量 + 挡板位置。少录任何一项，事后就没法判断是哪一环的问题。
+function recRow(f) {
+  if (!Rec.on) return;
+  if (Rec.rows.length >= Rec.maxRows) { stopRec(); return; }
+  const g = Sw.gh || { x: 0, y: 0, z: 0 };
+  Rec.rows.push([
+    (performance.now() - Rec.t0).toFixed(1),
+    f.x.toFixed(4), f.y.toFixed(4), f.z.toFixed(4),
+    Ble.gx.toFixed(2), Ble.gy.toFixed(2), Ble.gz.toFixed(2),
+    g.x.toFixed(4), g.y.toFixed(4), g.z.toFixed(4),
+    Rate.bias.x.toFixed(2), Rate.bias.y.toFixed(2), Rate.bias.z.toFixed(2),
+    Rate.raw.toFixed(2), Rate.yaw.toFixed(2), Rate.u.toFixed(3),
+    G.paddle.x.toFixed(1),
+    MODE, G.phase,
+  ].join(','));
+}
+
+const REC_HEAD = 't_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,' +
+                 'ghx,ghy,ghz,biasx,biasy,biasz,yaw_raw,yaw_f,yaw_u,paddle_x,mode,phase';
+
+function startRec() {
+  // 录制挂在「收到包」这条路上（recRow 在 parsePacket 里），没连手柄就是录空气。
+  // 不给这个检查的话，按下去有提示、挥半天、停止时才发现「太短了，没存」。
+  const live = Ble.connected && (performance.now() - (Ble.lastPkt || 0) < 500);
+  if (!live) { toast('先连上手柄再录 —— 没数据进来', 2800); return; }
+  Rec.on = true; Rec.t0 = performance.now(); Rec.rows = [];
+  toast('录制中 · 挥几下再按 O（或 0）停止', 2600);
+}
+
+function stopRec() {
+  if (!Rec.on) return;
+  Rec.on = false;
+  if (Rec.rows.length < 20) { toast('太短了，没存', 1800); return; }
+  const csv = REC_HEAD + '\n' + Rec.rows.join('\n') + '\n';
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const d = new Date();
+  const pad2 = n => String(n).padStart(2, '0');
+  a.download = `padlog-${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}` +
+               `-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  toast(`已存 ${Rec.rows.length} 帧 · 用 tools/analyze_log.js 看`, 3200);
+}
+
+function startCalib(ms = CAL_MS) {
+  Tilt.calUntil = performance.now() + ms;
+  Tilt.calN = 0; Tilt.calX = 0; Tilt.calY = 0;
+  Tilt.p0 = null;
+  Tilt.deg = 0; Tilt.rawDeg = 0;
+  Tilt.oe.reset();
+  haveSignal = false;
+}
+
+let haveSignal = false;   // 校准完成后置 true，挡板才开始跟
+
+function finishCalib() {
+  if (Tilt.calN < 6) { startCalib(400); return; }      // 包太少，再来一次
+  const mx = Tilt.calX / Tilt.calN;
+  const my = Tilt.calY / Tilt.calN;
+  const m  = Math.hypot(mx, my);
+  if (m < FLAT_G) {
+    // 平放/贴平：屏幕平面里没有重力，左右倾读不出来
+    Tilt.p0 = null;
+    Tilt.flat = true;
+    toast('把手柄竖起一点，别平放', 2600);
+    startCalib(600);          // 再等一次，别卡死
+    return;
+  }
+  Tilt.p0 = { x: mx / m, y: my / m };
+  Tilt.flat = false;
+  haveSignal = true;
+  toast('校准好了 · 歪一歪试试', 1600);
+}
+
+// 由「屏幕平面内的重力投影」算带符号侧倾角（度）
+function tiltDeg(px, py) {
+  if (!Tilt.p0) return 0;
+  const dot = Tilt.p0.x * px + Tilt.p0.y * py;
+  const crs = Tilt.p0.y * px - Tilt.p0.x * py;
+  if (Math.abs(dot) < 1e-6 && Math.abs(crs) < 1e-6) return 0;
+  return Math.atan2(crs, dot) * 180 / Math.PI;    // 正 = 顶端往右歪
+}
+
+function parsePacket(dv) {
+  // 注意：回调里的 value 是 DataView，**不能直接拿 .buffer**。
+  // DataView 可能带 byteOffset（底层是复用的接收缓冲区），直接取 buffer
+  // 会把别的包的数据当成本包的开头，症状是「偶发解析失败、校验和对不上」。
+  if (!dv || dv.byteLength < 11) return;
+  const p = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+  if (p[0] !== 0xA5) return;
+
+  // v2 = 17 字节（带陀螺仪），v1 = 11 字节。校验和位置跟着长度走。
+  const v2   = p.length >= 17;
+  const nSum = v2 ? 16 : 10;
+  let sum = 0;
+  for (let i = 0; i < nSum; i++) sum += p[i];
+  if ((sum & 0xff) !== p[nSum]) return;
+
+  const i16 = o => ((p[o] | (p[o + 1] << 8)) << 16) >> 16;
+  Ble.ax = i16(2);
+  Ble.ay = i16(4);
+  Ble.az = i16(6);
+  Ble.btnA = !!(p[8] & 1);
+  Ble.btnB = !!(p[8] & 2);
+  Ble.batt = p[9];
+  Ble.hasGyro = v2;
+  if (v2) {
+    Ble.gx = i16(10) / 10;    // 0.1°/s → °/s
+    Ble.gy = i16(12) / 10;
+    Ble.gz = i16(14) / 10;
+  }
+  const t = performance.now();
+  Ble.lastPkt = t;
+  Ble.pktCount++;
+
+  // 屏幕平面内的重力投影：z 是屏幕法线，直接丢掉
+  const px = Ble.ax / 1000, py = Ble.ay / 1000;
+  const flat = Math.hypot(px, py) < FLAT_G;
+
+  // K2 上升沿 = 发球。放在最前面：校准中、平放着也得能按键，
+  // 不然「按了没反应」会被当成手柄坏了。
+  if (Ble.btnB && !Ble.prevBtnB) fire();
+  Ble.prevBtnB = Ble.btnB;
+
+  // 解算无条件先跑：两种模式都不依赖倾斜零点，也不需要校准窗口
+  const f3 = { x: px, y: py, z: Ble.az / 1000 };
+  swingUpdate(f3, t);
+  Ble.rawSwing = clamp(Sw.v / 2.0, -1, 1);
+  rateUpdate(f3, t);
+  recRow(f3);
+
+  // ---- 校准窗口：只累计，不动挡板 ----
+  if (!Tilt.p0) {
+    if (t < Tilt.calUntil) {
+      if (!flat) { Tilt.calX += px; Tilt.calY += py; Tilt.calN++; }
+      return;
+    }
+    finishCalib();
+    return;
+  }
+
+  if (flat) { Tilt.flat = true; return; }
+  Tilt.flat = false;
+
+  // ---- 角度 → 1€ → 死区 → 归一化 → expo ----
+  Tilt.rawDeg = tiltDeg(px, py);
+  const dt = Tilt.lastT ? (t - Tilt.lastT) / 1000 : 0.02;
+  Tilt.lastT = t;
+
+  const f = Tilt.oe.filter(Tilt.rawDeg, dt);
+  Tilt.deg   = f.y;
+  Tilt.speed = f.speed;
+
+  let d = Tilt.deg;
+  if (flipX) d = -d;
+
+  // 死区：把 ±TILT_DEAD_DEG 挖掉，再把剩下的重新拉回 0..1，
+  // 不然「过死区」会有一个突跳。
+  const span = TILT_FULL_DEG - TILT_DEAD_DEG;
+  let v = 0;
+  if (Math.abs(d) > TILT_DEAD_DEG) {
+    v = sgn(d) * Math.min(1, (Math.abs(d) - TILT_DEAD_DEG) / span);
+  }
+  // expo：中段慢一点方便微调，两端不迟钝（y = (1-e)x + e·x³）
+  const a = Math.abs(v);
+  const shaped = (1 - TILT_EXPO) * a + TILT_EXPO * a * a * a;
+  Ble.rawTilt = haveSignal ? sgn(v) * shaped : 0;
+}
+
+// ---------------- 连接 ----------------
+async function connect() {
+  if (!navigator.bluetooth) {
+    toast('浏览器不支持 Web Bluetooth，请用 Chrome / Edge', 4000);
+    return;
+  }
+  try {
+    Ble.device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: NAME_HINT }],
+      optionalServices: [SVC_UUID],
+    });
+    Ble.device.addEventListener('gattserverdisconnected', onDisconnect);
+
+    const server = await Ble.device.gatt.connect();
+    const svc    = await server.getPrimaryService(SVC_UUID);
+    Ble.char     = await svc.getCharacteristic(TX_UUID);
+    Ble.char.addEventListener('characteristicvaluechanged', e => parsePacket(e.target.value));
+    await Ble.char.startNotifications();
+
+    Ble.connected = true;
+    haveSignal = false;
+    resetSwing();
+    resetRate();
+    startCalib(CAL_MS);                  // 握着别动，700ms 定零点（只有倾斜模式用得上）
+    toast(MODE === 'tilt' ? '握稳别动，校准中…' : '左右挥一挥试试', 1800);
+  } catch (err) {
+    if (err && err.name === 'NotFoundError') { toast('已取消连接', 1500); return; }
+    console.error(err);
+    toast('连接失败：' + (err.message || err), 4000);
+  }
+}
+
+function onDisconnect() {
+  Ble.connected = false;
+  haveSignal = false;
+  Tilt.p0 = null;
+  resetSwing();
+  resetRate();
+  if (Rec.on) stopRec();          // 别把半截子录像丢在内存里
+  toast('手柄已断开', 2000);
+}
+
+// ============================================================
+//  输入（鼠标 / 键盘兜底）
+// ============================================================
+let mouseTilt = 0, useMouse = false;
+
+window.addEventListener('mousemove', e => {
+  const r = cv.getBoundingClientRect();
+  mouseTilt = clamp(((e.clientX - r.left) / r.width) * 2 - 1, -1, 1);
+  useMouse = true;
+});
+window.addEventListener('mouseleave', () => { useMouse = false; });
+
+const keys = new Set();
+window.addEventListener('keydown', e => {
+  keys.add(e.code);
+  if (e.code === 'Space') {
+    // 阻止默认：页面上如果还有能聚焦的元素，空格会去「点」它
+    e.preventDefault();
+    fire();
+  }
+  if (e.code === 'KeyR') {
+    haveSignal = false;
+    startCalib(CAL_MS);
+    toast('握稳别动，重新校准…', 1200);
+  }
+  if (e.code === 'KeyD') document.getElementById('dbg').classList.toggle('on');
+  if (e.code === 'KeyH') document.getElementById('tips').classList.toggle('hide');
+  if (e.code === 'KeyF') {
+    // 只有一种情况需要它：屏幕朝外握着（看不见设备），左右会整体反过来
+    flipX = !flipX;
+    localStorage.setItem('sg_flip', flipX ? '1' : '0');
+    toast(flipX ? '左右已反向' : '左右已恢复', 1200);
+  }
+  if (e.code === 'KeyT') {
+    const order = ['rate', 'swing', 'tilt'];
+    MODE = order[(order.indexOf(MODE) + 1) % order.length];
+    localStorage.setItem('sg_mode', MODE);
+    resetSwing(); resetRate();
+    if (MODE === 'tilt') { haveSignal = false; startCalib(CAL_MS); }
+    toast(MODE === 'rate'  ? '转向模式 · 左右挥，板按速度滑'
+        : MODE === 'swing' ? '摆幅模式 · 老算法，做对照用'
+        :                    '倾斜模式 · 握稳校准，歪多少板在哪', 2200);
+  }
+  // 灵敏度：rate 模式调「满偏时横穿全屏用几秒」，swing 模式调增益
+  if (e.code === 'BracketRight' || e.code === 'BracketLeft') {
+    const k = e.code === 'BracketRight' ? 1 / 1.15 : 1.15;   // ] 更快 = 跨度更小
+    if (MODE === 'rate') {
+      RATE_SPAN = clamp(RATE_SPAN * k, 0.18, 2.0);
+      localStorage.setItem('sg_span', RATE_SPAN.toFixed(2));
+      toast('满偏跨度 ' + RATE_SPAN.toFixed(2) + 's', 1200);
+    } else {
+      SW_GAIN = clamp(Math.round(SW_GAIN * (1 / k)), 150, 4000);
+      localStorage.setItem('sg_gain', SW_GAIN);
+      toast('灵敏度 ' + SW_GAIN, 1200);
+    }
+  }
+  // O = 开始/停止录制，停止时自动下载 CSV
+  // 字母 O 和数字 0 都收 —— 这两个键长得几乎一样，只认 KeyO 等于强迫用户记一个
+  // 看不出来的区别，上一次就是这么白录的。
+  if (e.code === 'KeyO' || e.code === 'Digit0' || e.code === 'Numpad0') {
+    Rec.on ? stopRec() : startRec();
+  }
+});
+window.addEventListener('keyup', e => keys.delete(e.code));
+
+// 画布上的「连接手柄」按钮：点页面任意位置都不算，得点到那个胶囊上
+const BTN = { x: W / 2 - 96, y: 402, w: 192, h: 48 };
+cv.addEventListener('click', e => {
+  if (Ble.connected) return;
+  const r  = cv.getBoundingClientRect();
+  const cx = (e.clientX - r.left) / r.width  * W;
+  const cy = (e.clientY - r.top)  / r.height * H;
+  if (cx >= BTN.x && cx <= BTN.x + BTN.w && cy >= BTN.y && cy <= BTN.y + BTN.h) connect();
+});
+cv.addEventListener('mousemove', e => {
+  if (Ble.connected) { cv.style.cursor = 'default'; return; }
+  const r  = cv.getBoundingClientRect();
+  const cx = (e.clientX - r.left) / r.width  * W;
+  const cy = (e.clientY - r.top)  / r.height * H;
+  const on = cx >= BTN.x && cx <= BTN.x + BTN.w && cy >= BTN.y && cy <= BTN.y + BTN.h;
+  cv.style.cursor = on ? 'pointer' : 'default';
+});
+
+// ============================================================
+//  发球 / 重置
+// ============================================================
+function fire() {
+  if (G.phase === 'ready') {
+    G.phase = 'playing';
+    const sp = 330 + (G.level - 1) * 18;
+    const a  = rand(-0.35, 0.35);            // 出发角度别太正，否则前十几拍很无聊
+    G.ball.vx = Math.sin(a) * sp;
+    G.ball.vy = -Math.cos(a) * sp;
+  } else if (G.phase === 'clear') {
+    nextLevel();
+  }
+}
+
+function loseBall() {
+  G.lives--;
+  G.combo = 0;
+  // 不再震屏。上一版这里 G.shake = 9（整屏 ±9px 抖），
+  // 掉一颗球本来只是「重新来一发」，抖一下像摔了东西，
+  // 而且抖的时候挡板跟着晃，人会更慌。改成底部一条淡红提示。
+  G.dip = 1;
+  if (G.lives <= 0) {
+    G.phase = 'dead';
+    if (G.score > G.best) { G.best = G.score; localStorage.setItem('sg_best', G.best); }
+    setTimeout(() => {
+      G.phase = 'ready'; G.score = 0; G.lives = 3; G.level = 1;
+      buildLevel(1); resetBall();
+    }, 1600);
+  } else {
+    G.phase = 'ready';
+    resetBall();
+  }
+}
+
+function resetBall() {
+  G.ball.x = G.paddle.x;
+  G.ball.y = PADDLE_Y - BALL_R - 1;
+  G.ball.vx = G.ball.vy = 0;
+  G.ball.trail.length = 0;
+}
+
+function nextLevel() {
+  G.level++;
+  buildLevel(G.level);
+  resetBall();
+  G.phase = 'ready';
+}
+
+// ============================================================
+//  更新
+// ============================================================
+function update(dt) {
+  // ---- 输入 → 挡板 ----
+  const hasPad = Ble.connected && (performance.now() - Ble.lastPkt < 500);
+  // 11 字节老包没有陀螺仪，rate 无从算起 → 自动退回 swing，别让人对着不动的板猜
+  const mode = (MODE === 'rate' && !Ble.hasGyro) ? 'swing' : MODE;
+  let target;
+
+  if (hasPad && mode === 'rate') {
+    // rate：挡板按角速度给出的**速度**移动。手停 → 角速度 0 → 板立刻停。
+    // 这是空鼠的手感，也是这套方案最容易「精准」的原因：位置永远由速度积分，
+    // 而速度直接来自陀螺，中间没有任何会漂的东西。
+    G.paddle.x += Rate.v * dt;
+    G.paddle.x = clamp(G.paddle.x, G.paddle.w / 2, W - G.paddle.w / 2);
+    G.tilt = Rate.u < -1 ? -1 : Rate.u > 1 ? 1 : Rate.u;
+  } else if (hasPad && mode === 'swing') {
+    // 摆动：挡板按「手速 × 增益」移动，手停下就停住，不回中。
+    // 不回中是有意的：打砖块要的是指哪打哪，弹簧回中会让人一直跟它较劲。
+    const s = flipX ? -1 : 1;
+    G.paddle.x += s * Sw.v * SW_GAIN * dt;
+    G.paddle.x = clamp(G.paddle.x, G.paddle.w / 2, W - G.paddle.w / 2);
+    G.tilt = Ble.rawSwing;              // HUD 那根条显示的是当前手速
+  } else if (hasPad) {
+    // 倾斜模式但还在校准：挡板原地不动，别让鼠标趁机插一脚
+    if (haveSignal) { G.tilt = Ble.rawTilt; target = (G.tilt + 1) / 2; }
+  } else {
+    if (keys.has('ArrowLeft') || keys.has('KeyA'))  mouseTilt = clamp(mouseTilt - dt * 2.2, -1, 1);
+    if (keys.has('ArrowRight') || keys.has('KeyD')) mouseTilt = clamp(mouseTilt + dt * 2.2, -1, 1);
+    G.tilt = lerp(G.tilt, mouseTilt, 1 - Math.pow(1 - 0.45, dt * 60));
+    target = (G.tilt + 1) / 2;
+  }
+
+  if (target !== undefined) {
+    const wantX = target * (W - G.paddle.w) + G.paddle.w / 2;
+    // 手柄给的是已经平滑过的位置，直接贴上去（0.85 只是补包间隔的毛刺）
+    G.paddle.x = lerp(G.paddle.x, wantX, hasPad ? 0.85 : 0.55);
+    G.paddle.x = clamp(G.paddle.x, G.paddle.w / 2, W - G.paddle.w / 2);
+  }
+
+  // ---- 待发球：球黏在挡板上 ----
+  if (G.phase === 'ready') {
+    G.ball.x = G.paddle.x;
+    G.ball.y = PADDLE_Y - BALL_R - 1;
+    return;
+  }
+
+  if (G.phase === 'clear') return;
+
+  // ---- 球 ----
+  const b = G.ball;
+  const steps = Math.ceil((Math.hypot(b.vx, b.vy) * dt) / 8);   // 分步，防高速穿砖
+  const n = Math.max(1, Math.min(steps, 8));
+
+  for (let s = 0; s < n; s++) {
+    b.x += b.vx * dt / n;
+    b.y += b.vy * dt / n;
+
+    // 左右墙
+    if (b.x - BALL_R < 0)      { b.x = BALL_R;     b.vx = Math.abs(b.vx);  }
+    if (b.x + BALL_R > W)      { b.x = W - BALL_R; b.vx = -Math.abs(b.vx); }
+    // 顶
+    if (b.y - BALL_R < 0)      { b.y = BALL_R;     b.vy = Math.abs(b.vy);  }
+
+    // 挡板：按击中位置决定反弹角度，边缘更斜
+    if (b.vy > 0 &&
+        b.y + BALL_R >= PADDLE_Y && b.y + BALL_R <= PADDLE_Y + PADDLE_H + 6 &&
+        b.x >= G.paddle.x - G.paddle.w / 2 - BALL_R &&
+        b.x <= G.paddle.x + G.paddle.w / 2 + BALL_R) {
+      b.y = PADDLE_Y - BALL_R;
+      const rel = clamp((b.x - G.paddle.x) / (G.paddle.w / 2), -1, 1);
+      const ang = rel * 1.02;                       // 最多 ±58°
+      const sp  = clamp(Math.hypot(b.vx, b.vy) * 1.012, 320, 760);
+      b.vx = Math.sin(ang) * sp;
+      b.vy = -Math.cos(ang) * sp;
+      G.combo = 0;                                  // 碰板即断连击
+    }
+
+    // 砖块
+    for (let i = G.bricks.length - 1; i >= 0; i--) {
+      if (hitBrick(G.bricks[i])) {
+        const bk = G.bricks[i];
+        bk.hit = 1;
+        bk.hp--;
+        if (bk.hp <= 0) {
+          G.bricks.splice(i, 1);
+          G.combo++;
+          G.score += 10 * Math.min(G.combo, 5);
+          burst(bk);
+          if (G.bricks.length === 0) { G.phase = 'clear'; G.flash = 1; }
+        } else {
+          G.score += 4;
+        }
+        break;
+      }
+    }
+
+    // 掉底
+    if (b.y - BALL_R > H) { loseBall(); return; }
+  }
+
+  // 拖尾
+  b.trail.push({ x: b.x, y: b.y });
+  if (b.trail.length > 9) b.trail.shift();
+
+  // ---- 粒子 ----
+  for (let i = G.particles.length - 1; i >= 0; i--) {
+    const p = G.particles[i];
+    p.vy += 900 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+    if (p.life <= 0) G.particles.splice(i, 1);
+  }
+
+  // ---- 砖块命中缩放 ----
+  for (const bk of G.bricks) if (bk.hit > 0) bk.hit = Math.max(0, bk.hit - dt * 5);
+
+  G.flash = Math.max(0, G.flash - dt * 1.8);
+  if (G.dip > 0) G.dip = Math.max(0, G.dip - dt * 1.6);
+}
+
+function hitBrick(bk) {
+  const b = G.ball;
+  const nx = clamp(b.x, bk.x, bk.x + bk.w);
+  const ny = clamp(b.y, bk.y, bk.y + bk.h);
+  const dx = b.x - nx, dy = b.y - ny;
+  if (dx * dx + dy * dy > BALL_R * BALL_R) return false;
+
+  // 用「最小穿透轴」决定从哪面弹：比按速度方向猜可靠，
+  // 高速斜着撞进去时不会出现两个轴同时反转的粘连。
+  const cx = bk.x + bk.w / 2, cy = bk.y + bk.h / 2;
+  const ox = (bk.w / 2 + BALL_R) - Math.abs(b.x - cx);
+  const oy = (bk.h / 2 + BALL_R) - Math.abs(b.y - cy);
+
+  if (ox < oy) {
+    b.x += (b.x < cx ? -ox : ox);
+    b.vx = -b.vx;
+  } else {
+    b.y += (b.y < cy ? -oy : oy);
+    b.vy = -b.vy;
+  }
+  return true;
+}
+
+function burst(bk) {
+  const n = 10;
+  for (let i = 0; i < n; i++) {
+    G.particles.push({
+      x: bk.x + rand(4, bk.w - 4),
+      y: bk.y + rand(4, bk.h - 4),
+      vx: rand(-160, 160),
+      vy: rand(-260, 60),
+      life: rand(0.35, 0.75),
+      max: 0.75,
+      color: bk.color,
+      r: rand(1.6, 3.4),
+    });
+  }
+}
+
+// ============================================================
+//  绘制
+// ============================================================
+function draw() {
+  // 背景
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0e1636');
+  g.addColorStop(0.55, '#0a1029');
+  g.addColorStop(1, '#070b1c');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // 顶部一层很淡的光晕，让上半屏不闷
+  const halo = ctx.createRadialGradient(W / 2, 120, 20, W / 2, 120, 420);
+  halo.addColorStop(0, 'rgba(77,226,255,0.06)');
+  halo.addColorStop(1, 'rgba(77,226,255,0)');
+  ctx.fillStyle = halo;
+  ctx.fillRect(0, 0, W, 520);
+
+  drawHUD();
+  drawBricks();
+  drawParticles();
+  drawPaddle();
+  drawBall();
+  drawOverlay();
+  drawRecBadge();
+
+  // 掉球提示：屏幕最下沿一条淡红，代替原来的整屏抖动
+  if (G.dip > 0) {
+    const gg = ctx.createLinearGradient(0, H, 0, H - 90);
+    gg.addColorStop(0, `rgba(255,92,114,${G.dip * 0.30})`);
+    gg.addColorStop(1, 'rgba(255,92,114,0)');
+    ctx.fillStyle = gg;
+    ctx.fillRect(0, H - 90, W, 90);
+  }
+
+  if (G.flash > 0.01) {
+    ctx.fillStyle = `rgba(77,226,255,${G.flash * 0.10})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+
+// 录制状态角标。以前只在按 D 的调试面板里显示，等于「按了不知道有没有在录」——
+// 上次白录一场就是这么来的。呼吸的红点 + 实时帧数，扫一眼就知道。
+function drawRecBadge() {
+  if (!Rec.on) return;
+  const blink = 0.55 + 0.45 * Math.sin(performance.now() / 220);
+  ctx.save();
+  ctx.textBaseline = 'middle';
+  ctx.globalAlpha = blink;
+  ctx.fillStyle = '#ff5c72';
+  ctx.beginPath();
+  ctx.arc(W / 2 - 40, 28, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#ff9aa8';
+  ctx.font = '600 12px -apple-system,sans-serif';
+  ctx.fillText('REC ' + Rec.rows.length, W / 2 - 28, 28);
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.save();
+  ctx.textBaseline = 'middle';
+
+  // 分数
+  ctx.fillStyle = '#7b87b8';
+  ctx.font = '600 12px -apple-system,sans-serif';
+  ctx.fillText('分数', 24, 40);
+  ctx.fillStyle = '#e8ecff';
+  ctx.font = '700 30px -apple-system,sans-serif';
+  ctx.fillText(String(G.score), 24, 62);
+
+  // 最高分
+  ctx.fillStyle = '#5b678f';
+  ctx.font = '500 11px -apple-system,sans-serif';
+  ctx.fillText('最高 ' + G.best, 24, 84);
+
+  // 生命：一排小球，跟游戏里的球同形
+  for (let i = 0; i < G.lives; i++) {
+    ctx.beginPath();
+    ctx.arc(W - 30 - i * 22, 44, 7, 0, Math.PI * 2);
+    ctx.fillStyle = '#e8ecff';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(77,226,255,.75)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // 关卡
+  ctx.fillStyle = '#7b87b8';
+  ctx.font = '600 12px -apple-system,sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText('第 ' + G.level + ' 关', W - 24, 78);
+  ctx.textAlign = 'left';
+
+  // 连击：只在 2 以上出现，颜色随连击升高
+  if (G.combo >= 2) {
+    const a = Math.min(1, 0.4 + G.combo * 0.2);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = G.combo >= 5 ? '#ffb347' : '#4de2ff';
+    ctx.font = '700 20px -apple-system,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('×' + G.combo + ' 连击', W / 2, 60);
+    ctx.textAlign = 'left';
+    ctx.globalAlpha = 1;
+  }
+
+  // 倾斜指示条 —— 一眼确认「它在读我」。手柄没连就不画，省得误导。
+  if (Ble.connected) {
+    const bx = W / 2 - 80, by = 88, bw = 160, bh = 3;
+    ctx.fillStyle = 'rgba(36,48,92,.9)';
+    ctx.beginPath();
+    ctx.roundRect(bx, by, bw, bh, 2);
+    ctx.fill();
+
+    const cx = bx + bw / 2;
+    ctx.fillStyle = 'rgba(123,135,184,.5)';
+    ctx.fillRect(cx - 0.5, by - 2, 1, bh + 4);
+
+    if (haveSignal || MODE === 'swing') {
+      const px = cx + G.tilt * (bw / 2 - 10);
+      ctx.beginPath();
+      ctx.arc(px, by + bh / 2, 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#4de2ff';
+      ctx.fill();
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawBricks() {
+  for (const bk of G.bricks) {
+    const k = 1 - bk.hit * 0.12;
+    const w = bk.w * k, h = bk.h * k;
+    const x = bk.x + (bk.w - w) / 2, y = bk.y + (bk.h - h) / 2;
+
+    ctx.save();
+    // 竖向渐变：上亮下暗，像一块有厚度的塑料片
+    const g = ctx.createLinearGradient(0, y, 0, y + h);
+    g.addColorStop(0, bk.color);
+    g.addColorStop(1, shade(bk.color, -0.34));
+    ctx.fillStyle = g;
+
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 4);
+    ctx.fill();
+
+    // 顶部高光
+    ctx.fillStyle = 'rgba(255,255,255,.22)';
+    ctx.beginPath();
+    ctx.roundRect(x + 3, y + 2.5, w - 6, 2.5, 1.2);
+    ctx.fill();
+
+    // 硬砖（要打两下）加一圈白描边做提示
+    if (bk.maxHp > 1) {
+      ctx.strokeStyle = bk.hp > 1 ? 'rgba(255,255,255,.6)' : 'rgba(255,255,255,.18)';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.roundRect(x + 2, y + 2, w - 4, h - 4, 3);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+function drawPaddle() {
+  const x = G.paddle.x - G.paddle.w / 2, y = PADDLE_Y;
+  ctx.save();
+
+  // 外发光：手柄连着时用青色，鼠标操作时用中性色，一眼看出控制来源
+  ctx.shadowColor = Ble.connected ? 'rgba(77,226,255,.75)' : 'rgba(232,236,255,.4)';
+  ctx.shadowBlur = 18;
+
+  const g = ctx.createLinearGradient(0, y, 0, y + PADDLE_H);
+  g.addColorStop(0, '#ffffff');
+  g.addColorStop(1, '#c9d2f0');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.roundRect(x, y, G.paddle.w, PADDLE_H, 6.5);
+  ctx.fill();
+
+  ctx.restore();
+}
+
+function drawBall() {
+  const b = G.ball;
+  if (G.phase === 'dead') return;
+
+  // 拖尾
+  for (let i = 0; i < b.trail.length; i++) {
+    const t = b.trail[i];
+    const a = (i / b.trail.length) * 0.28;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, BALL_R * (0.35 + i / b.trail.length * 0.5), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(77,226,255,${a})`;
+    ctx.fill();
+  }
+
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,255,255,.85)';
+  ctx.shadowBlur = 14;
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, BALL_R, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const p of G.particles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+let toastText = '', toastUntil = 0;
+function toast(s, ms) { toastText = s; toastUntil = performance.now() + ms; }
+
+function drawOverlay() {
+  const now = performance.now();
+
+  if (G.phase === 'ready') {
+    if (Ble.connected && MODE === 'tilt' && !haveSignal) {
+      centerText('握稳别动', 330, '700 30px', '#4de2ff');
+      centerText('正在记零点', 372, '500 15px', '#7b87b8');
+    } else {
+      centerText('准备好了吗', 330, '700 34px', '#e8ecff');
+      let hint = '挪动鼠标 · 按空格发球';
+      if (Ble.connected) {
+        hint = MODE === 'swing' ? '左右摆手柄 · 按 K2 发球'
+                                : '左右歪手柄 · 按 K2 发球';
+      }
+      centerText(hint, 374, '500 15px', '#7b87b8');
+    }
+  }
+
+  if (G.phase === 'dead') {
+    centerText('游戏结束', 340, '700 40px', '#ff5c72');
+    centerText('得分 ' + G.score, 392, '600 20px', '#e8ecff');
+  }
+
+  if (G.phase === 'clear') {
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = 'rgba(7,11,28,.6)';
+    ctx.fillRect(0, 300, W, 160);
+    ctx.restore();
+    centerText('第 ' + G.level + ' 关 通过', 360, '700 36px', '#4dd4ac');
+    centerText('按 K2 / 空格 继续', 406, '500 15px', '#7b87b8');
+  }
+
+  // 未连接时画一个「连接手柄」胶囊。
+  // v1 用的是右下角常驻的 HTML 面板，连接成功 2.6 秒后它还会弹回来，
+  // 正好压在挡板那条横带上 —— 画在画布上、连上就不再画，才不会有这种事。
+  if (!Ble.connected) drawConnectBtn();
+
+  if (toastText && now < toastUntil) {
+    ctx.save();
+    ctx.globalAlpha = clamp((toastUntil - now) / 300, 0, 1);
+    ctx.fillStyle = 'rgba(18,26,61,.95)';
+    ctx.strokeStyle = '#24305c';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(W / 2 - 132, 500, 264, 44, 22);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#e8ecff';
+    ctx.font = '600 14px -apple-system,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(toastText, W / 2, 522);
+    ctx.restore();
+  }
+}
+
+function drawConnectBtn() {
+  const b = BTN;
+  ctx.save();
+  ctx.shadowColor = 'rgba(77,226,255,.35)';
+  ctx.shadowBlur = 22;
+  ctx.fillStyle = 'rgba(77,226,255,.14)';
+  ctx.strokeStyle = 'rgba(77,226,255,.55)';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.roundRect(b.x, b.y, b.w, b.h, 24);
+  ctx.fill(); ctx.stroke();
+
+  ctx.shadowBlur = 0;
+  // 蓝牙图标：竖脊 + 上下两个三角（标准 BT 符号的画法，不用外链字体）
+  const bx0 = b.x + 36, btop = b.y + 14, bmid = b.y + 24, bbot = b.y + 34, bw2 = 9;
+  ctx.beginPath();
+  ctx.moveTo(bx0, btop);            // 竖脊
+  ctx.lineTo(bx0, bbot);
+  ctx.moveTo(bx0, btop);            // 上三角
+  ctx.lineTo(bx0 + bw2, btop + 5);
+  ctx.lineTo(bx0, bmid);
+  ctx.moveTo(bx0, bmid);            // 下三角
+  ctx.lineTo(bx0 + bw2, bmid + 5);
+  ctx.lineTo(bx0, bbot);
+  ctx.moveTo(bx0 + bw2, btop + 5);  // 两条斜线连到左上
+  ctx.lineTo(bx0 - 6, bmid + 5);
+  ctx.moveTo(bx0 + bw2, bmid + 5);
+  ctx.lineTo(bx0 - 6, btop + 5);
+  ctx.strokeStyle = '#4de2ff';
+  ctx.lineWidth = 1.8;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+
+  ctx.fillStyle = '#4de2ff';
+  ctx.font = '600 15px -apple-system,"PingFang SC",sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('连接手柄', b.x + 60, b.y + b.h / 2 - 1);
+
+  ctx.fillStyle = 'rgba(123,135,184,.8)';
+  ctx.font = '500 10px -apple-system,sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('SitGuard Pad · Chrome 蓝牙', W / 2, b.y + b.h + 18);
+  ctx.restore();
+}
+
+function centerText(s, y, font, color) {
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = font + ' -apple-system,"PingFang SC",sans-serif';
+  ctx.fillStyle = color;
+  ctx.fillText(s, W / 2, y);
+  ctx.restore();
+}
+
+// 颜色加深/提亮：只处理 #rrggbb
+function shade(hex, k) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const f = v => clamp(Math.round(k < 0 ? v * (1 + k) : v + (255 - v) * k), 0, 255);
+  return `rgb(${f(r)},${f(g)},${f(b)})`;
+}
+
+// ============================================================
+//  调试面板
+// ============================================================
+const dbgEl = document.getElementById('dbg');
+let dbgTick = 0;
+function drawDebug() {
+  if (!dbgEl.classList.contains('on')) return;
+  if (++dbgTick % 3) return;
+  const modeLine = MODE === 'rate'
+    ? `rate  yaw ${Rate.yaw.toFixed(0)}°/s  u ${Rate.u.toFixed(2)}  v ${Rate.v.toFixed(0)}px/s\n` +
+      `bias ${Rate.bias.x.toFixed(1)},${Rate.bias.y.toFixed(1)},${Rate.bias.z.toFixed(1)}  still ${Rate.stillN}\n` +
+      `span ${RATE_SPAN.toFixed(2)}s  dead ${YAW_DEAD}  full ${YAW_FULL}\n`
+    : MODE === 'tilt'
+    ? `tilt  raw ${Tilt.rawDeg.toFixed(1)}°  f ${Tilt.deg.toFixed(1)}°\n`
+    : `swing  a ${(Sw.a * 1000).toFixed(0)}mg  v ${Sw.v.toFixed(2)}m/s\n`;
+  dbgEl.textContent =
+    `ax ${Ble.ax.toString().padStart(6)}\n` +
+    `ay ${Ble.ay.toString().padStart(6)}\n` +
+    `az ${Ble.az.toString().padStart(6)}\n` +
+    modeLine +
+    `pkt ${Ble.pktCount}  ${(performance.now() - Ble.lastPkt).toFixed(0)}ms` +
+    (Rec.on ? `\nREC ${Rec.rows.length} 帧` : '') + '\n' +
+    `flip ${flipX ? 'ON' : 'off'}  bat ${Ble.batt}%  btn ${Ble.btnA ? 'A' : '·'}${Ble.btnB ? 'B' : '·'}`;
+}
+
+// ============================================================
+//  主循环
+// ============================================================
+function loop(t) {
+  const dt = G.lastT ? Math.min((t - G.lastT) / 1000, 0.05) : 0.016;
+  G.lastT = t;
+
+  update(dt);
+  draw();
+  drawDebug();
+
+  requestAnimationFrame(loop);
+}
+
+// 手柄掉线超过 1.5 秒，把状态刷回「未连接」
+setInterval(() => {
+  if (Ble.connected && performance.now() - Ble.lastPkt > 1500) {
+    Ble.connected = false;
+    haveSignal = false;
+    Tilt.p0 = null;
+    toast('手柄无数据（可能已断开）', 2600);
+  }
+}, 800);
+
+buildLevel(1);
+resetBall();
+requestAnimationFrame(loop);
+
+// 提示 12 秒后自动淡出：记住快捷键之后它就是噪音。按 H 叫回来。
+setTimeout(() => document.getElementById('tips').classList.add('hide'), 12000);
+</script>
+</body>
+</html>
